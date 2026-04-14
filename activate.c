@@ -90,33 +90,6 @@ static int is_valid_fallback(struct topo_obj *cpu, struct topo_obj *original,
 }
 
 /*
- * Find the CPU with the most available slots among valid candidates.
- * This avoids the "first match bias" that can cause IRQs to cluster
- * on the same fallback CPU repeatedly.
- *
- * Returns the best CPU or NULL if none found.
- */
-static struct topo_obj *find_best_fallback_in_list(GList *list,
-						   struct topo_obj *original,
-						   cpumask_t *tried_cpus)
-{
-	struct topo_obj *best = NULL;
-	GList *iter;
-
-	for (iter = list; iter; iter = iter->next) {
-		struct topo_obj *cpu = iter->data;
-
-		if (!is_valid_fallback(cpu, original, tried_cpus))
-			continue;
-
-		/* FIX: Select CPU with most slots_left to avoid clustering */
-		if (!best || cpu->slots_left > best->slots_left)
-			best = cpu;
-	}
-	return best;
-}
-
-/*
  * Recursively collect all CPU objects under a given topology object.
  * This fixes the NUMA fallback issue where numa_node->children contains
  * packages/caches, not CPUs directly.
@@ -160,15 +133,41 @@ static struct topo_obj *find_best_cpu_under_obj(struct topo_obj *obj,
 }
 
 /*
+ * Convert balance level to string for logging.
+ */
+static const char *balance_level_str(int level)
+{
+	switch (level) {
+	case BALANCE_NONE:
+		return "none";
+	case BALANCE_PACKAGE:
+		return "package";
+	case BALANCE_CACHE:
+		return "cache";
+	case BALANCE_CORE:
+		return "core";
+	default:
+		return "unknown";
+	}
+}
+
+/*
  * Try to find an alternative CPU when the primary target returns ENOSPC.
  * Returns 0 on success (IRQ placed on alternative CPU), -1 on failure.
  *
  * Uses iteration with a tried_cpus bitmask to avoid retrying the same CPU.
  *
- * Priority order:
- *   1. Same cache domain CPUs with slots_left > 0 (best slots_left first)
- *   2. Same NUMA node CPUs with slots_left > 0 (traverses full tree)
- *   3. Any allowed CPU with slots_left > 0 (best slots_left first)
+ * IMPORTANT: This function respects the IRQ's configured balance level.
+ * If the user configured an IRQ to balance at a specific level (e.g., cache),
+ * fallback will only search within that scope. If no CPU is available within
+ * the constrained scope, we warn the user and fail rather than violating the
+ * configured policy.
+ *
+ * Scope by balance level:
+ *   - BALANCE_CORE: No fallback possible (single CPU, fail immediately)
+ *   - BALANCE_CACHE: Only search within same cache domain
+ *   - BALANCE_PACKAGE: Only search within same package
+ *   - BALANCE_NONE: Search within same NUMA node (widest scope)
  *
  * FIXES APPLIED:
  *   1. NUMA fallback now traverses topology tree to find actual CPUs
@@ -178,61 +177,102 @@ static struct topo_obj *find_best_cpu_under_obj(struct topo_obj *obj,
  *   5. Consistent slots_left update logic (saturate at 0, not negative)
  *   6. Guard slots_left decrement on success
  *   7. Load-aware CPU selection (most slots_left first to avoid bias)
+ *   8. Respect user-configured balance level policy
  */
 static int try_fallback_cpu(struct irq_info *info, cpumask_t applied_mask,
 			    int attempt __attribute__((unused)))
 {
 	struct topo_obj *original = info->assigned_obj;
 	struct topo_obj *fallback = NULL;
-	struct topo_obj *cache_parent = NULL;
-	struct topo_obj *numa_parent = NULL;
+	struct topo_obj *search_scope = NULL;
 	cpumask_t tried_cpus;
 	char buf[PATH_MAX];
 	FILE *file;
 	int ret;
 	int saved_errno;
 	int attempts = 0;
+	int balance_level = info->level;
+
+	/*
+	 * BALANCE_CORE means the IRQ is pinned to a specific CPU.
+	 * No fallback is possible without violating the configured policy.
+	 */
+	if (balance_level == BALANCE_CORE) {
+		log(TO_ALL, LOG_WARNING,
+			"IRQ %d: cannot fallback - balance level is 'core' "
+			"(CPU %d saturated, no alternative within policy)\n",
+			info->irq, original->number);
+		return -1;
+	}
 
 	cpus_clear(tried_cpus);
 
-	/* Find cache domain parent */
-	cache_parent = original->parent;
-	while (cache_parent && cache_parent->obj_type != OBJ_TYPE_CACHE)
-		cache_parent = cache_parent->parent;
+	/*
+	 * Determine the search scope based on assigned_obj type.
+	 *
+	 * For CPU-assigned IRQs: search within the appropriate parent domain
+	 * based on balance_level (cache → package → NUMA).
+	 *
+	 * For domain-assigned IRQs: the assigned domain IS the search scope.
+	 * This respects the user's balance_level policy - we only search
+	 * within the domain irqbalance already chose for this IRQ.
+	 */
+	if (original->obj_type == OBJ_TYPE_CPU) {
+		/* CPU-assigned: find appropriate parent based on balance_level */
+		switch (balance_level) {
+		case BALANCE_CACHE:
+			search_scope = original->parent;
+			while (search_scope && search_scope->obj_type != OBJ_TYPE_CACHE)
+				search_scope = search_scope->parent;
+			break;
+		case BALANCE_PACKAGE:
+			search_scope = original->parent;
+			while (search_scope && search_scope->obj_type != OBJ_TYPE_PACKAGE)
+				search_scope = search_scope->parent;
+			break;
+		case BALANCE_NONE:
+			search_scope = original->parent;
+			while (search_scope && search_scope->obj_type != OBJ_TYPE_NODE)
+				search_scope = search_scope->parent;
+			break;
+		default:
+			search_scope = NULL;
+		}
+	} else {
+		/*
+		 * Domain-assigned IRQ: the assigned object IS the search scope.
+		 * We search for individual CPUs within this domain.
+		 */
+		search_scope = original;
+		log(TO_ALL, LOG_DEBUG,
+			"IRQ %d: domain-assigned (obj_type=%d), searching within assigned scope\n",
+			info->irq, original->obj_type);
+	}
 
-	/* Find NUMA node parent */
-	numa_parent = original->parent;
-	while (numa_parent && numa_parent->obj_type != OBJ_TYPE_NODE)
-		numa_parent = numa_parent->parent;
+	if (!search_scope) {
+		log(TO_ALL, LOG_WARNING,
+			"IRQ %d: no valid search scope for fallback (balance_level=%s)\n",
+			info->irq, balance_level_str(balance_level));
+		return -1;
+	}
 
 	while (attempts < MAX_FALLBACK_ATTEMPTS) {
-		fallback = NULL;
-
-		/* Priority 1: Try CPUs in same cache domain (load-aware) */
-		if (cache_parent) {
-			fallback = find_best_fallback_in_list(
-				cache_parent->children, original, &tried_cpus);
-		}
-
 		/*
-		 * Priority 2: Try CPUs in same NUMA node
-		 * FIX: Use recursive traversal since numa_node->children
-		 * may contain packages/caches, not CPUs directly.
+		 * Search for fallback CPU within the determined scope.
+		 * Use recursive traversal to find actual CPU objects.
+		 *
+		 * For CPU-assigned IRQs: 'original' is excluded from candidates.
+		 * For domain-assigned IRQs: 'original' is not a CPU, so
+		 * is_valid_fallback() will skip it automatically.
 		 */
-		if (!fallback && numa_parent) {
-			fallback = find_best_cpu_under_obj(
-				numa_parent, original, &tried_cpus);
-		}
-
-		/* Priority 3: Try any allowed CPU (load-aware selection) */
-		if (!fallback) {
-			fallback = find_best_fallback_in_list(
-				cpus, original, &tried_cpus);
-		}
+		fallback = find_best_cpu_under_obj(search_scope, original, &tried_cpus);
 
 		if (!fallback) {
-			log(TO_ALL, LOG_DEBUG,
-				"IRQ %d: no fallback CPU available\n", info->irq);
+			log(TO_ALL, LOG_WARNING,
+				"IRQ %d: no fallback CPU available within "
+				"scope (balance_level=%s, obj_type=%d)\n",
+				info->irq, balance_level_str(balance_level),
+				search_scope->obj_type);
 			return -1;
 		}
 
@@ -240,11 +280,19 @@ static int try_fallback_cpu(struct irq_info *info, cpumask_t applied_mask,
 		cpus_or(tried_cpus, tried_cpus, fallback->mask);
 		attempts++;
 
-		log(TO_ALL, LOG_DEBUG,
-			"IRQ %d: ENOSPC fallback from CPU %d to CPU %d "
-			"(attempt %d, slots_left=%d)\n",
-			info->irq, original->number, fallback->number,
-			attempts, fallback->slots_left);
+		if (original->obj_type == OBJ_TYPE_CPU) {
+			log(TO_ALL, LOG_DEBUG,
+				"IRQ %d: ENOSPC fallback from CPU %d to CPU %d "
+				"(attempt %d, slots_left=%d)\n",
+				info->irq, original->number, fallback->number,
+				attempts, fallback->slots_left);
+		} else {
+			log(TO_ALL, LOG_DEBUG,
+				"IRQ %d: ENOSPC fallback to CPU %d "
+				"(attempt %d, slots_left=%d, scope_type=%d)\n",
+				info->irq, fallback->number,
+				attempts, fallback->slots_left, original->obj_type);
+		}
 
 		/* Update assignment and compute new mask */
 		info->assigned_obj = fallback;
@@ -319,8 +367,9 @@ static int try_fallback_cpu(struct irq_info *info, cpumask_t applied_mask,
 		return 0;
 	}
 
-	log(TO_ALL, LOG_DEBUG,
-		"IRQ %d: max fallback attempts (%d) reached\n",
+	log(TO_ALL, LOG_WARNING,
+		"IRQ %d: max fallback attempts (%d) reached, "
+		"all CPUs saturated within policy scope\n",
 		info->irq, MAX_FALLBACK_ATTEMPTS);
 	return -1;
 }
@@ -400,17 +449,21 @@ error:
 		/* Do not blacklist the IRQ on transient errors. */
 		break;
 	case ENOSPC: /* Specified CPU APIC is full. */
-		if (info->assigned_obj->obj_type != OBJ_TYPE_CPU)
-			break;
-
 		/*
-		 * FIX: Consistent slots_left update - set to SLOTS_SATURATED (0)
-		 * to mark CPU as full, avoiding arbitrary negative drift.
+		 * For CPU-assigned IRQs, mark the CPU as saturated.
+		 * For domain-assigned IRQs (cache/package/NUMA), we cannot
+		 * determine which specific CPU failed, so skip slots_left update.
 		 */
-		info->assigned_obj->slots_left = SLOTS_SATURATED;
-		log(TO_ALL, LOG_DEBUG,
-			"IRQ %d: CPU %d saturated (ENOSPC), slots_left set to %d\n",
-			info->irq, info->assigned_obj->number, SLOTS_SATURATED);
+		if (info->assigned_obj->obj_type == OBJ_TYPE_CPU) {
+			info->assigned_obj->slots_left = SLOTS_SATURATED;
+			log(TO_ALL, LOG_DEBUG,
+				"IRQ %d: CPU %d saturated (ENOSPC), slots_left set to %d\n",
+				info->irq, info->assigned_obj->number, SLOTS_SATURATED);
+		} else {
+			log(TO_ALL, LOG_DEBUG,
+				"IRQ %d: ENOSPC on domain-assigned IRQ (obj_type=%d)\n",
+				info->irq, info->assigned_obj->obj_type);
+		}
 
 		/*
 		 * Try fallback CPUs before giving up. This allows IRQs to
