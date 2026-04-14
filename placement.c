@@ -37,10 +37,41 @@ struct obj_placement {
 		struct irq_info *info;
 };
 
+/*
+ * Threshold for slot-based penalty. CPUs with slots_left >= this value
+ * receive zero penalty (considered to have ample headroom).
+ * CPUs with fewer slots receive an increasing penalty to prefer
+ * CPUs with more capacity.
+ */
+#define SLOTS_PENALTY_THRESHOLD 10
+
+/*
+ * Penalty multiplier per slot below threshold.
+ *
+ * The value 1000 is chosen because:
+ * - Typical IRQ load values range from thousands to millions
+ * - A penalty of 1000-9000 (for slots 9 down to 1) is significant
+ *   enough to influence placement when loads are similar
+ * - But not so large as to override load-based decisions entirely
+ *   for lightly loaded CPUs
+ *
+ * Example: CPU with load=5000 and slots=2 has adjusted_cost = 5000 + 8000 = 13000
+ *          CPU with load=8000 and slots=10 has adjusted_cost = 8000 + 0 = 8000
+ *          → Prefers the higher-load CPU with more headroom
+ *
+ * CPUs with slots_left >= SLOTS_PENALTY_THRESHOLD get zero penalty,
+ * so their placement is determined purely by load balancing.
+ */
+#define SLOTS_PENALTY_FACTOR 1000
+
 static void find_best_object(struct topo_obj *d, void *data)
 {
 	struct obj_placement *best = (struct obj_placement *)data;
 	uint64_t newload;
+	uint64_t adjusted_cost;
+	uint64_t best_adjusted_cost;
+	uint64_t slots_penalty;
+	uint64_t best_slots_penalty;
 
 	/*
  	 * Don't consider the unspecified numa node here
@@ -63,12 +94,43 @@ static void find_best_object(struct topo_obj *d, void *data)
 		return;
 
 	newload = d->load;
-	if (newload < best->best_cost) {
+
+	/*
+	 * Factor in slots_left to prefer CPUs with more available capacity.
+	 * When loads are similar, prefer CPUs with more headroom to reduce
+	 * likelihood of ENOSPC. Using a penalty system: lower slots = higher
+	 * effective cost.
+	 *
+	 * Penalty calculation: slots < SLOTS_PENALTY_THRESHOLD adds penalty
+	 * Cast to uint64_t to ensure safe arithmetic with newload.
+	 */
+	if (d->slots_left < SLOTS_PENALTY_THRESHOLD)
+		slots_penalty = (uint64_t)(SLOTS_PENALTY_THRESHOLD - d->slots_left) * SLOTS_PENALTY_FACTOR;
+	else
+		slots_penalty = 0;
+	adjusted_cost = newload + slots_penalty;
+
+	if (best->best) {
+		if (best->best->slots_left < SLOTS_PENALTY_THRESHOLD)
+			best_slots_penalty = (uint64_t)(SLOTS_PENALTY_THRESHOLD - best->best->slots_left) * SLOTS_PENALTY_FACTOR;
+		else
+			best_slots_penalty = 0;
+		best_adjusted_cost = best->best_cost + best_slots_penalty;
+	} else {
+		best_adjusted_cost = ULLONG_MAX;
+	}
+
+	if (adjusted_cost < best_adjusted_cost) {
 		best->best = d;
 		best->best_cost = newload;
-	} else if (newload == best->best_cost) {
-		if (!best->best || g_list_length(d->interrupts) < g_list_length(best->best->interrupts)) {
+	} else if (adjusted_cost == best_adjusted_cost) {
+		/*
+		 * Tie-breaker: prefer CPU with more slots_left (more headroom).
+		 * This avoids O(n) g_list_length() calls and uses already-available data.
+		 */
+		if (!best->best || d->slots_left > best->best->slots_left) {
 			best->best = d;
+			best->best_cost = newload;
 		}
 	}
 }
