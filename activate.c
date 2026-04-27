@@ -359,6 +359,23 @@ static int try_fallback_cpu(struct irq_info *info, cpumask_t applied_mask,
 		 *
 		 */
 		migrate_irq_obj(original, fallback, info);
+		/*
+		 * migrate_irq_obj() unconditionally increments the source
+		 * object's slots_left (0 -> 1), which would make the original
+		 * CPU look eligible again. The kernel returned ENOSPC, so its
+		 * vector table is still full; re-clamp to SATURATED so we
+		 * don't immediately retry the same dead-end placement.
+		 *
+		 * Only re-clamp when the source is an actual CPU. For
+		 * domain-assigned IRQs (cache/package/NUMA), the original
+		 * is a domain object whose slots_left aggregates its CPUs
+		 * and was never marked SLOTS_SATURATED by the ENOSPC handler
+		 * (see activate_mapping(): the obj_type==CPU branch).
+		 * Force-saturating the whole domain would penalize every CPU
+		 * inside it on the next placement cycle.
+		 */
+		if (original->obj_type == OBJ_TYPE_CPU)
+			original->slots_left = SLOTS_SATURATED;
 		info->moved = 0;
 		log(TO_ALL, LOG_DEBUG,
 			"IRQ %d: successfully placed on fallback CPU %d "
